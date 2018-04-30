@@ -6,11 +6,21 @@ import argparse
 import os
 import sys
 import time
+import pickle
 
 import tensorflow as tf
+tfe = tf.contrib.eager
 
-import tensorflow.contrib.eager as tfe
+pkl_path = r'c:\Users\wmp\TensorFlow\DeepInterestNetwork\din\dataset.pkl'
 
+with open(pkl_path, 'rb') as f:
+  train_set = pickle.load(f)
+  test_set = pickle.load(f)
+  cate_list = pickle.load(f)
+  user_count, item_count, cate_count = pickle.load(f)
+
+train_batch_size = 32
+test_batch_size = 512
 
 layers = tf.keras.layers
 
@@ -36,7 +46,7 @@ class Embedding(layers.Layer):
 
 class ItemBias(layers.Layer):
   def __init__(self, vocab_size, **kwargs):
-    super(Embedding, self).__init__(**kwargs)
+    super(ItemBias, self).__init__(**kwargs)
     self.vocab_size = vocab_size
 
   def build(self, _):
@@ -52,7 +62,7 @@ class ItemBias(layers.Layer):
 
 class Attention(tf.keras.Model):
   def __init__(self, hidden_units):
-    super(Attention, self).__init()
+    super(Attention, self).__init__()
 
     self.hidden_units = hidden_units
 
@@ -102,7 +112,7 @@ class ModelDIN(tf.keras.Model):
   """
 
   def __init__(self, hidden_units, user_count, item_count, category_list, use_dice=False):
-    super(ModelDIN, self).__init()
+    super(ModelDIN, self).__init__()
 
     self.hidden_units = hidden_units
     embedding_dim = hidden_units // 2
@@ -119,16 +129,15 @@ class ModelDIN(tf.keras.Model):
     self.fc3 = layers.Dense(1)
 
 
-
   def call(self, inputs, training=False):
     """
 
-    :param inputs: tuple(u, i, y, hist_i, sl) for training
+    :param inputs: tuple(u, i, hist_i, sl) for training
     :param training:
     :return:
     """
 
-    (u, i, y, hist_i, sl) = inputs
+    (u, i, hist_i, sl) = inputs
 
     ic = tf.gather(self.category_list, i)
     i_emb = tf.concat([self.item_embedding(i), self.category_embedding(ic)], axis=1)
@@ -141,5 +150,77 @@ class ModelDIN(tf.keras.Model):
     outputs = self.fc1(din_i)
     outputs = self.fc2(outputs)
     outputs = self.fc3(outputs)
+    predictions = self.item_bias(i) + outputs
 
-    pass
+    return predictions
+
+
+def eval(model):
+
+  def eval_gen():
+    for u, ts, ij in test_set:
+      yield (u, ts, ij[0], ij[1], len(ts))
+
+  ds_eval = tf.data.Dataset.from_generator(eval_gen, (tf.int32, tf.int32, tf.int32, tf.int32, tf.int64), (tf.TensorShape([]), tf.TensorShape([None]), tf.TensorShape([]), tf.TensorShape([]), tf.TensorShape([])) )
+  ds_eval = ds_eval.padded_batch(16, padded_shapes=([], [None], [], [], []) )
+
+  auc_sum = 0.0
+  test_size = 0
+  for (u, ts, i, j, sl) in tfe.Iterator(ds_eval):
+    pred_i = model((u, i, ts, sl), training=False)
+    pred_j = model((u, j, ts, sl), training=False)
+
+    test_size += int(u.shape[0])
+    auc_sum += float(tf.reduce_sum(tf.to_float(pred_i - pred_j > 0 )) * int(u.shape[0]))
+
+  test_gauc = auc_sum / test_size
+
+  return test_gauc
+
+def clip_gradients(grads_and_vars, clip_ratio):
+  gradients, variables = zip(*grads_and_vars)
+  clipped, _ = tf.clip_by_global_norm(gradients, clip_ratio)
+  return zip(clipped, variables)
+
+def train_one_epoch(model, optimizer, train_data):
+  tf.train.get_or_create_global_step()
+
+  def loss(inputs, labels):
+    return tf.reduce_mean(
+      tf.nn.sigmoid_cross_entropy_with_logits(
+        logits=model(inputs, training=True),
+        labels=labels)
+    )
+
+  val_grad_fn = tfe.implicit_value_and_gradients(loss)
+  for (u, ts, i, y, sl) in tfe.Iterator(train_data):
+    value, grads_and_vars = val_grad_fn((u, i, ts, sl), y)
+    optimizer.apply_gradients(clip_gradients(grads_and_vars, 5), global_step=tf.train.get_global_step())
+
+    if tf.grain.get_global_step() % 1000 == 0:
+      eval(model)
+
+def main(_):
+
+  def train_gen():
+    for u, ts, i, y in train_set:
+      yield (u, ts, i, y, len(ts))
+
+  ds_train = tf.data.Dataset.from_generator(train_gen,
+                                      (tf.int32, tf.int32, tf.int32, tf.int32, tf.int32),
+                                      (tf.TensorShape([]), tf.TensorShape([None]), tf.TensorShape([]), tf.TensorShape([]), tf.TensorShape([])))
+  ds_train = ds_train.padded_batch(train_batch_size, padded_shapes=([], [None], [], [], []))
+
+  optimizer = tf.train.AdamOptimizer()
+  m = ModelDIN(128, user_count, item_count, cate_list, use_dice=False)
+
+  eval(m)
+  for _ in range(50):
+    train_one_epoch(m, optimizer, ds_train)
+
+
+if __name__ == "__main__":
+  parser = argparse.ArgumentParser()
+
+  FLAGS, unparsed = parser.parse_known_args()
+  tfe.run(main=main, argv=[sys.argv[0]] + unparsed)
