@@ -11,7 +11,8 @@ import pickle
 import tensorflow as tf
 tfe = tf.contrib.eager
 
-pkl_path = r'c:\Users\wmp\TensorFlow\DeepInterestNetwork\din\dataset.pkl'
+#pkl_path = r'c:\Users\wmp\TensorFlow\DeepInterestNetwork\din\dataset.pkl'
+pkl_path = r'/Users/jangmino/tensorflow/DeepInterestNetwork/din/dataset.pkl'
 
 with open(pkl_path, 'rb') as f:
   train_set = pickle.load(f)
@@ -66,8 +67,8 @@ class Attention(tf.keras.Model):
 
     self.hidden_units = hidden_units
 
-    self.attention_fc1 = layers.Dense(80, activation=tf.sigmoid)
-    self.attention_fc2 = layers.Dense(40, activation=tf.sigmoid)
+    self.attention_fc1 = layers.Dense(16, activation=tf.sigmoid)
+    self.attention_fc2 = layers.Dense(8, activation=tf.sigmoid)
     self.attention_fc3 = layers.Dense(1)
     self.attention_fc4 = layers.Dense(self.hidden_units)
 
@@ -115,7 +116,7 @@ class ModelDIN(tf.keras.Model):
     super(ModelDIN, self).__init__()
 
     self.hidden_units = hidden_units
-    embedding_dim = hidden_units // 2
+    embedding_dim = hidden_units // 2 # Warning: changed for speed
     self.item_embedding = Embedding(item_count, embedding_dim)
     self.item_bias = ItemBias(item_count)
     self.category_embedding = Embedding(len(category_list), embedding_dim)
@@ -124,8 +125,8 @@ class ModelDIN(tf.keras.Model):
 
     self.bn_din = layers.BatchNormalization(name='bn_din')
 
-    self.fc1 = layers.Dense(80)
-    self.fc2 = layers.Dense(40)
+    self.fc1 = layers.Dense(16)
+    self.fc2 = layers.Dense(8)
     self.fc3 = layers.Dense(1)
 
 
@@ -141,7 +142,7 @@ class ModelDIN(tf.keras.Model):
 
     ic = tf.gather(self.category_list, i)
     i_emb = tf.concat([self.item_embedding(i), self.category_embedding(ic)], axis=1)
-    h_emb = tf.concat([self.item_embedding(hist_i), self.category_embedding(hist_i)])
+    h_emb = tf.concat([self.item_embedding(hist_i), self.category_embedding(hist_i)], axis=2)
 
     hist = self.attention((i_emb, h_emb, sl), training=training)
     din_i = tf.concat([hist, i_emb], axis=-1)
@@ -162,18 +163,25 @@ def eval(model):
       yield (u, ts, ij[0], ij[1], len(ts))
 
   ds_eval = tf.data.Dataset.from_generator(eval_gen, (tf.int32, tf.int32, tf.int32, tf.int32, tf.int64), (tf.TensorShape([]), tf.TensorShape([None]), tf.TensorShape([]), tf.TensorShape([]), tf.TensorShape([])) )
-  ds_eval = ds_eval.padded_batch(16, padded_shapes=([], [None], [], [], []) )
+  # ds_eval = ds_eval.padded_batch(test_batch_size, padded_shapes=([], [None], [], [], []) )
+  ds_eval = ds_eval.batch(test_batch_size)
 
   auc_sum = 0.0
   test_size = 0
-  for (u, ts, i, j, sl) in tfe.Iterator(ds_eval):
-    pred_i = model((u, i, ts, sl), training=False)
-    pred_j = model((u, j, ts, sl), training=False)
 
-    test_size += int(u.shape[0])
-    auc_sum += float(tf.reduce_sum(tf.to_float(pred_i - pred_j > 0 )) * int(u.shape[0]))
+  total_time = 0
+  start = time.time()
+  for (u, ts, i, j, sl) in tfe.Iterator(ds_eval):
+    # pred_i = model((u, i, ts, sl), training=False)
+    # pred_j = model((u, j, ts, sl), training=False)
+
+    test_size += 1 #int(u.shape[0])
+    # auc_sum += float(tf.reduce_mean(tf.to_float(pred_i - pred_j > 0 )) * int(u.shape[0]))
 
   test_gauc = auc_sum / test_size
+  total_time += (time.time() - start)
+  sys.stderr.write("Elapsed {}\n".format(total_time))
+  sys.stderr.flush()
 
   return test_gauc
 
@@ -212,7 +220,7 @@ def main(_):
   ds_train = ds_train.padded_batch(train_batch_size, padded_shapes=([], [None], [], [], []))
 
   optimizer = tf.train.AdamOptimizer()
-  m = ModelDIN(128, user_count, item_count, cate_list, use_dice=False)
+  m = ModelDIN(64, user_count, item_count, cate_list, use_dice=False)
 
   eval(m)
   for _ in range(50):
