@@ -11,8 +11,8 @@ import pickle
 import tensorflow as tf
 tfe = tf.contrib.eager
 
-#pkl_path = r'c:\Users\wmp\TensorFlow\DeepInterestNetwork\din\dataset.pkl'
-pkl_path = r'/Users/jangmino/tensorflow/DeepInterestNetwork/din/dataset.pkl'
+pkl_path = r'c:\Users\wmp\TensorFlow\DeepInterestNetwork\din\dataset.pkl'
+#pkl_path = r'/Users/jangmino/tensorflow/DeepInterestNetwork/din/dataset.pkl'
 
 with open(pkl_path, 'rb') as f:
   train_set = pickle.load(f)
@@ -20,7 +20,7 @@ with open(pkl_path, 'rb') as f:
   cate_list = pickle.load(f)
   user_count, item_count, cate_count = pickle.load(f)
 
-train_batch_size = 32
+train_batch_size = 512
 test_batch_size = 512
 
 layers = tf.keras.layers
@@ -151,20 +151,57 @@ class ModelDIN(tf.keras.Model):
     outputs = self.fc1(din_i)
     outputs = self.fc2(outputs)
     outputs = self.fc3(outputs)
+    outputs = tf.reshape(outputs, [-1])
     predictions = self.item_bias(i) + outputs
 
     return predictions
 
+def parse_train(line):
+  """
+  reviewerID, hist, next, y
+  :param line:
+  :return:
+  """
+  items = tf.string_split([line], ",").values
+  reviewerID = tf.string_to_number(items[0], out_type=tf.int64)
+  hists_ = tf.string_split([items[1]], ":").values
+  hist = tf.string_to_number(hists_, out_type=tf.int64)
+  i = tf.string_to_number(items[2], out_type=tf.int64)
+  y = tf.string_to_number(items[3], out_type=tf.float32)
+
+  length = tf.cast(tf.shape(hist)[0], dtype=tf.int64)
+  return reviewerID, hist, i, y, length
+
+def parse_eval(line):
+  """
+  reviewerID, hist, i, j
+  :param line:
+  :return:
+  """
+  items = tf.string_split([line], ",").values
+  reviewerID = tf.string_to_number(items[0], out_type=tf.int64)
+  hists_ = tf.string_split([items[1]], ":").values
+  hist = tf.string_to_number(hists_, out_type=tf.int64)
+  i = tf.string_to_number(items[2], out_type=tf.int64)
+  j = tf.string_to_number(items[3], out_type=tf.int64)
+
+  length = tf.cast(tf.shape(hist)[0], dtype=tf.int64)
+  return reviewerID, hist, i, j, length
+
 
 def eval(model):
 
-  def eval_gen():
-    for u, ts, ij in test_set:
-      yield (u, ts, ij[0], ij[1], len(ts))
+  # def eval_gen():
+  #   for u, ts, ij in test_set:
+  #     yield (u, ts, ij[0], ij[1], len(ts))
+  #
+  # ds_eval = tf.data.Dataset.from_generator(eval_gen, (tf.int32, tf.int32, tf.int32, tf.int32, tf.int64), (tf.TensorShape([]), tf.TensorShape([None]), tf.TensorShape([]), tf.TensorShape([]), tf.TensorShape([])) )
+  # # ds_eval = ds_eval.padded_batch(test_batch_size, padded_shapes=([], [None], [], [], []) )
+  # ds_eval = ds_eval.batch(test_batch_size)
 
-  ds_eval = tf.data.Dataset.from_generator(eval_gen, (tf.int32, tf.int32, tf.int32, tf.int32, tf.int64), (tf.TensorShape([]), tf.TensorShape([None]), tf.TensorShape([]), tf.TensorShape([]), tf.TensorShape([])) )
-  # ds_eval = ds_eval.padded_batch(test_batch_size, padded_shapes=([], [None], [], [], []) )
-  ds_eval = ds_eval.batch(test_batch_size)
+  ds_eval = tf.data.TextLineDataset('din_test.csv').skip(1).map(parse_eval).padded_batch(
+    test_batch_size, padded_shapes=([], [None], [], [], [])
+    )
 
   auc_sum = 0.0
   test_size = 0
@@ -172,11 +209,11 @@ def eval(model):
   total_time = 0
   start = time.time()
   for (u, ts, i, j, sl) in tfe.Iterator(ds_eval):
-    # pred_i = model((u, i, ts, sl), training=False)
-    # pred_j = model((u, j, ts, sl), training=False)
+    pred_i = model((u, i, ts, sl), training=False)
+    pred_j = model((u, j, ts, sl), training=False)
 
-    test_size += 1 #int(u.shape[0])
-    # auc_sum += float(tf.reduce_mean(tf.to_float(pred_i - pred_j > 0 )) * int(u.shape[0]))
+    test_size += int(u.shape[0])
+    auc_sum += float(tf.reduce_mean(tf.to_float(pred_i - pred_j > 0 )) * int(u.shape[0]))
 
   test_gauc = auc_sum / test_size
   total_time += (time.time() - start)
@@ -190,7 +227,8 @@ def clip_gradients(grads_and_vars, clip_ratio):
   clipped, _ = tf.clip_by_global_norm(gradients, clip_ratio)
   return zip(clipped, variables)
 
-def train_one_epoch(model, optimizer, train_data):
+def train_one_epoch(epoch_i, model, optimizer, train_data, log_interval=10):
+
   tf.train.get_or_create_global_step()
 
   def loss(inputs, labels):
@@ -201,34 +239,118 @@ def train_one_epoch(model, optimizer, train_data):
     )
 
   val_grad_fn = tfe.implicit_value_and_gradients(loss)
-  for (u, ts, i, y, sl) in tfe.Iterator(train_data):
-    value, grads_and_vars = val_grad_fn((u, i, ts, sl), y)
-    optimizer.apply_gradients(clip_gradients(grads_and_vars, 5), global_step=tf.train.get_global_step())
 
-    if tf.grain.get_global_step() % 1000 == 0:
-      eval(model)
+  loss_sum = 0
+  n_step = 0
+  for (u, ts, i, y, sl) in tfe.Iterator(train_data):
+    with tf.contrib.summary.record_summaries_every_n_global_steps(log_interval):
+      value, grads_and_vars = val_grad_fn((u, i, ts, sl), y)
+      tf.contrib.summary.scalar("loss", value)
+      optimizer.apply_gradients(clip_gradients(grads_and_vars, 5), global_step=tf.train.get_global_step())
+      loss_sum += value
+
+    n_step += 1
+
+    if tf.train.get_global_step().numpy() % 100 == 0:
+      test_gauc = eval(model)
+      print('Epoch %d Global_step %d\tTrain_loss: %.4f\tEval_GAUC: %.4f' %
+            (epoch_i, tf.train.get_global_step().numpy(),
+             loss_sum / 100, test_gauc))
+      sys.stdout.flush()
+      loss_sum = 0
+      n_step = 0
+
 
 def main(_):
 
-  def train_gen():
-    for u, ts, i, y in train_set:
-      yield (u, ts, i, y, len(ts))
+  # def train_gen():
+  #   for u, ts, i, y in train_set:
+  #     yield (u, ts, i, y, len(ts))
+  #
+  # ds_train = tf.data.Dataset.from_generator(train_gen,
+  #                                     (tf.int32, tf.int32, tf.int32, tf.int32, tf.int32),
+  #                                     (tf.TensorShape([]), tf.TensorShape([None]), tf.TensorShape([]), tf.TensorShape([]), tf.TensorShape([])))
+  # ds_train = ds_train.padded_batch(train_batch_size, padded_shapes=([], [None], [], [], []))
 
-  ds_train = tf.data.Dataset.from_generator(train_gen,
-                                      (tf.int32, tf.int32, tf.int32, tf.int32, tf.int32),
-                                      (tf.TensorShape([]), tf.TensorShape([None]), tf.TensorShape([]), tf.TensorShape([]), tf.TensorShape([])))
-  ds_train = ds_train.padded_batch(train_batch_size, padded_shapes=([], [None], [], [], []))
+  if FLAGS.no_gpu or tfe.num_gpus() <= 0:
+    print(tfe.num_gpus())
+    device = "/cpu:0"
+  else:
+    device = "/gpu:0"
+  print("Using device %s." % device)
 
-  optimizer = tf.train.AdamOptimizer()
-  m = ModelDIN(64, user_count, item_count, cate_list, use_dice=False)
+  log_dir = os.path.join(FLAGS.dir, "summaries")
+  tf.gfile.MakeDirs(log_dir)
+  train_summary_writer = tf.contrib.summary.create_file_writer(
+      os.path.join(log_dir, "train"), flush_millis=10000)
+  # test_summary_writer = tf.contrib.summary.create_file_writer(
+  #     os.path.join(log_dir, "eval"), flush_millis=10000, name="eval")
 
-  eval(m)
-  for _ in range(50):
-    train_one_epoch(m, optimizer, ds_train)
+  ds_train = tf.data.TextLineDataset('din_train.csv').skip(1).map(parse_train).padded_batch(
+    train_batch_size, padded_shapes=([], [None], [], [], [])
+    )
 
+  model_objects = {
+    'model': ModelDIN(64, user_count, item_count, cate_list, use_dice=False),
+    'optimizer': tf.train.AdamOptimizer(FLAGS.learning_rate)
+  }
+
+  checkpoint_prefix = os.path.join(FLAGS.dir, 'ckpt')
+  latest_cpkt = tf.train.latest_checkpoint(FLAGS.dir)
+  if latest_cpkt:
+    print('Using latest checkpoint at ' + latest_cpkt)
+  checkpoint = tfe.Checkpoint(**{})
+  # Restore variables on creation if a checkpoint exists.
+  checkpoint.restore(latest_cpkt)
+
+  with tf.device(device):
+    for i in range(FLAGS.num_epochs):
+      start = time.time()
+      with train_summary_writer.as_default():
+        train_one_epoch(epoch_i=i, train_data=ds_train, log_interval=FLAGS.log_interval, **model_objects)
+        end = time.time()
+        checkpoint.save(checkpoint_prefix)
+        print('\nTrain time for epoch #%d (step %d): %f' %
+              (checkpoint.save_counter.numpy(),
+               checkpoint.step_counter.numpy(),
+               end - start))
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
+  parser.add_argument(
+      "--dir",
+      type=str,
+      default="./dnn_eager/",
+      help="Directory to locate data files and save logs.")
+  parser.add_argument(
+      "--log_interval",
+      type=int,
+      default=10,
+      metavar="N",
+      help="Log training loss every log_interval batches.")
+  parser.add_argument(
+      "--num_epochs", type=int, default=20, help="Number of epochs to train.")
+  parser.add_argument(
+      "--rnn_cell_sizes",
+      type=int,
+      nargs="+",
+      default=[256, 128],
+      help="List of sizes for each layer of the RNN.")
+  parser.add_argument(
+      "--batch_size",
+      type=int,
+      default=64,
+      help="Batch size for training and eval.")
+  parser.add_argument(
+      "--learning_rate",
+      type=float,
+      default=0.001,
+      help="Learning rate to be used during training.")
+  parser.add_argument(
+      "--no_gpu",
+      action="store_true",
+      default=False,
+      help="Disables GPU usage even if a GPU is available.")
 
   FLAGS, unparsed = parser.parse_known_args()
   tfe.run(main=main, argv=[sys.argv[0]] + unparsed)
