@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import pickle
+import numpy as np
 
 import tensorflow as tf
 tfe = tf.contrib.eager
@@ -87,6 +88,7 @@ class Attention(tf.keras.Model):
 
     # Mask
     key_masks = tf.sequence_mask(keys_length, tf.shape(keys)[1])   # [B, T]
+    sys.stdout.flush()
     key_masks = tf.expand_dims(key_masks, 1) # [B, 1, T]
     paddings = tf.ones_like(outputs) * (-2 ** 32 + 1)
     outputs = tf.where(key_masks, outputs, paddings)  # [B, 1, T]
@@ -112,11 +114,13 @@ class ModelDIN(tf.keras.Model):
   An Eager Implementation of Deep Interest Network
   """
 
-  def __init__(self, hidden_units, user_count, item_count, category_list, use_dice=False):
+  def __init__(self, hidden_units, user_count, item_count, category_list, device="/cpu:0", use_dice=False):
     super(ModelDIN, self).__init__()
 
+    self.device=device
     self.hidden_units = hidden_units
     embedding_dim = hidden_units // 2 # Warning: changed for speed
+
     self.item_embedding = Embedding(item_count, embedding_dim)
     self.item_bias = ItemBias(item_count)
     self.category_embedding = Embedding(len(category_list), embedding_dim)
@@ -129,7 +133,6 @@ class ModelDIN(tf.keras.Model):
     self.fc2 = layers.Dense(8)
     self.fc3 = layers.Dense(1)
 
-
   def call(self, inputs, training=False):
     """
 
@@ -137,12 +140,11 @@ class ModelDIN(tf.keras.Model):
     :param training:
     :return:
     """
+    (u, i, i_c, hist_i, hist_c, sl) = inputs
 
-    (u, i, hist_i, sl) = inputs
-
-    ic = tf.gather(self.category_list, i)
-    i_emb = tf.concat([self.item_embedding(i), self.category_embedding(ic)], axis=1)
-    h_emb = tf.concat([self.item_embedding(hist_i), self.category_embedding(hist_i)], axis=2)
+    #ic = tf.gather(self.category_list, i)
+    i_emb = tf.concat([self.item_embedding(i), self.category_embedding(i_c)], axis=1)
+    h_emb = tf.concat([self.item_embedding(hist_i), self.category_embedding(hist_c)], axis=2)
 
     hist = self.attention((i_emb, h_emb, sl), training=training)
     din_i = tf.concat([hist, i_emb], axis=-1)
@@ -207,17 +209,25 @@ def eval(model):
   test_size = 0
 
   total_time = 0
+  total_model = 0
   start = time.time()
-  for (u, ts, i, j, sl) in tfe.Iterator(ds_eval):
-    pred_i = model((u, i, ts, sl), training=False)
-    pred_j = model((u, j, ts, sl), training=False)
+  for (u, ts, i, j, sl) in ds_eval:
+    hist_c = tf.convert_to_tensor(list(map(lambda x: cate_list[x], ts.numpy())), dtype=tf.int64)
+    i_c = tf.convert_to_tensor(list(map(lambda x: cate_list[x], i.numpy())), dtype=tf.int64)
+    j_c = tf.convert_to_tensor(list(map(lambda x: cate_list[x], j.numpy())), dtype=tf.int64)
+
+    inf_start = time.time()
+    pred_i = model((u, i, i_c, ts, hist_c, sl), training=False)
+    pred_j = model((u, j, j_c, ts, hist_c, sl), training=False)
+    inf_end = time.time()
+    total_model += inf_end - inf_start
 
     test_size += int(u.shape[0])
     auc_sum += float(tf.reduce_mean(tf.to_float(pred_i - pred_j > 0 )) * int(u.shape[0]))
 
   test_gauc = auc_sum / test_size
   total_time += (time.time() - start)
-  sys.stderr.write("Elapsed {}\n".format(total_time))
+  sys.stderr.write("Elapsed total {} : model {}\n".format(total_time, total_model))
   sys.stderr.flush()
 
   return test_gauc
@@ -227,9 +237,7 @@ def clip_gradients(grads_and_vars, clip_ratio):
   clipped, _ = tf.clip_by_global_norm(gradients, clip_ratio)
   return zip(clipped, variables)
 
-def train_one_epoch(epoch_i, model, optimizer, train_data, log_interval=10):
-
-  tf.train.get_or_create_global_step()
+def train_one_epoch(epoch_i, model, optimizer, train_data, step_counter, log_interval=10):
 
   def loss(inputs, labels):
     return tf.reduce_mean(
@@ -242,11 +250,17 @@ def train_one_epoch(epoch_i, model, optimizer, train_data, log_interval=10):
 
   loss_sum = 0
   n_step = 0
-  for (u, ts, i, y, sl) in tfe.Iterator(train_data):
+
+  category_list = tf.convert_to_tensor(cate_list, dtype=tf.int64)
+
+  for (u, ts, i, y, sl) in train_data:
+    hist_c = tf.convert_to_tensor(list(map(lambda x: cate_list[x], ts.numpy())), dtype=tf.int64)
+    i_c = tf.convert_to_tensor(list(map(lambda x: cate_list[x], i.numpy())), dtype=tf.int64)
     with tf.contrib.summary.record_summaries_every_n_global_steps(log_interval):
-      value, grads_and_vars = val_grad_fn((u, i, ts, sl), y)
+      with tf.device("/cpu:0"):
+        value, grads_and_vars = val_grad_fn((u, i, i_c, ts, hist_c, sl), y)
       tf.contrib.summary.scalar("loss", value)
-      optimizer.apply_gradients(clip_gradients(grads_and_vars, 5), global_step=tf.train.get_global_step())
+      optimizer.apply_gradients(clip_gradients(grads_and_vars, 5), global_step=step_counter)
       loss_sum += value
 
     n_step += 1
@@ -290,30 +304,38 @@ def main(_):
     train_batch_size, padded_shapes=([], [None], [], [], [])
     )
 
+  # tf.keras.backend.set_session(tf.Session(config=tf.ConfigProto(
+  #   gpu_options=tf.GPUOptions(allow_growth=True),
+  #   log_device_placement=True))
+  # )
+
+
   model_objects = {
-    'model': ModelDIN(64, user_count, item_count, cate_list, use_dice=False),
-    'optimizer': tf.train.AdamOptimizer(FLAGS.learning_rate)
+    'model': ModelDIN(64, user_count, item_count, cate_list, device=device, use_dice=False),
+    'optimizer': tf.train.AdamOptimizer(FLAGS.learning_rate),
+    'step_counter': tf.train.get_or_create_global_step(),
   }
 
   checkpoint_prefix = os.path.join(FLAGS.dir, 'ckpt')
   latest_cpkt = tf.train.latest_checkpoint(FLAGS.dir)
   if latest_cpkt:
     print('Using latest checkpoint at ' + latest_cpkt)
-  checkpoint = tfe.Checkpoint(**{})
+  checkpoint = tfe.Checkpoint(**model_objects)
   # Restore variables on creation if a checkpoint exists.
   checkpoint.restore(latest_cpkt)
 
-  with tf.device(device):
-    for i in range(FLAGS.num_epochs):
-      start = time.time()
-      with train_summary_writer.as_default():
-        train_one_epoch(epoch_i=i, train_data=ds_train, log_interval=FLAGS.log_interval, **model_objects)
-        end = time.time()
-        checkpoint.save(checkpoint_prefix)
-        print('\nTrain time for epoch #%d (step %d): %f' %
-              (checkpoint.save_counter.numpy(),
-               checkpoint.step_counter.numpy(),
-               end - start))
+  #with tf.device(device):
+  test_gauc = eval(model_objects['model'])
+  for i in range(FLAGS.num_epochs):
+    start = time.time()
+    with train_summary_writer.as_default():
+      train_one_epoch(epoch_i=i, train_data=ds_train, log_interval=FLAGS.log_interval, **model_objects)
+      end = time.time()
+      checkpoint.save(checkpoint_prefix)
+      print('\nTrain time for epoch #%d (step %d): %f' %
+            (checkpoint.save_counter.numpy(),
+             checkpoint.step_counter.numpy(),
+             end - start))
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
@@ -353,4 +375,7 @@ if __name__ == "__main__":
       help="Disables GPU usage even if a GPU is available.")
 
   FLAGS, unparsed = parser.parse_known_args()
-  tfe.run(main=main, argv=[sys.argv[0]] + unparsed)
+  tfe.enable_eager_execution(config=tf.ConfigProto(gpu_options=tf.GPUOptions(allow_growth=True)),
+                                                   device_policy=tfe.DEVICE_PLACEMENT_SILENT)
+  # tfe.enable_eager_execution()
+  tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
